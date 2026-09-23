@@ -1,0 +1,2667 @@
+<!--
+  VISION — Real-Time Vision Disability Simulator
+  ==============================================
+  Single-file WebXR / webcam app. No build step. Nothing is recorded or uploaded.
+
+  TESTING INSTRUCTIONS
+  --------------------
+  Desktop / laptop:
+    Open in Chrome over HTTPS or http://localhost (camera APIs need a secure
+    context; file:// will fail). Allow camera access. Confirm all 6 conditions
+    plus Normal look distinct on the live feed. Keys 1–7 switch modes, C holds
+    a Normal compare, [ and ] nudge the active radius. Watch the FPS counter
+    in the top-right (target ≥30, ideal 60).
+
+  Mobile:
+    Host on HTTPS. `npx serve --ssl` or ngrok both work. The camera request
+    uses facingMode: 'environment' so phones open the rear camera. The <video>
+    element is playsinline and muted so iOS Safari will autoplay it.
+
+  Headset / AR (Quest and other passthrough browsers):
+    Serve a hosted HTTPS URL, not localhost, unless you are using a USB dev
+    bridge. Tap Enter AR. The session is immersive-ar with optional
+    camera-access (so the shader can sample passthrough pixels) and
+    dom-overlay (so this HTML panel is a screen-space HUD). If the browser
+    exposes camera-access, each eye's camera texture is drawn through the
+    same fragment shaders as the webcam path. If immersive-ar is not
+    supported, the AR button is hidden and the page falls back to
+    getUserMedia. If AR starts but the browser will not hand over pixels,
+    the HUD says so — passthrough then stays unfiltered, which is a browser
+    limit, not a silent failure.
+
+  No camera in this browser?
+    Use "Preview with a test pattern". It is labeled TEST PATTERN and is only
+    a stand-in so the shaders can be checked. It is not the real-world mode.
+
+  Tuning from the console (no recompile):
+    setMode('tunnel'); VISION.params.tunnel.radius = 0.2;
+    Shaders are precompiled at load. setMode() only swaps the active program
+    and uniforms. Add ?shaders=1 to print every fragment shader on screen.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#14120f">
+  <meta name="description" content="VISION — a real-time vision disability simulator. Live camera or AR passthrough, processed every frame.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>VISION — Real-Time Vision Disability Simulator</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect fill='%2314120f' width='32' height='32'/%3E%3Cpath d='M2 16c4.5-6 9-9 14-9s9.5 3 14 9c-4.5 6-9 9-14 9S6.5 22 2 16z' fill='none' stroke='%23c6a15a' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23f4efe6'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,520;9..144,620&family=Outfit:wght@380;500;640&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --ink: #14120f;
+      --ink-2: #1c1914;
+      --plate: rgba(18, 16, 13, 0.94);
+      --line: rgba(214, 196, 168, 0.32);
+      --line-strong: rgba(214, 196, 168, 0.55);
+      --brass: #c6a15a;
+      --brass-2: #e6d3a4;
+      --ivory: #f4efe6;
+      --muted: #b7afa3;
+      --dim: #8a8176;
+      --live: #d64532;
+      --ok: #c5d49a;
+      --warn: #e0a15a;
+      --bad: #e07a62;
+      --serif: "Fraunces", "Iowan Old Style", Palatino, "Palatino Linotype", "Times New Roman", serif;
+      --sans: "Outfit", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+      --mono: "SFMono-Regular", ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+      --safe-t: env(safe-area-inset-top, 0px);
+      --safe-b: env(safe-area-inset-bottom, 0px);
+      --safe-l: env(safe-area-inset-left, 0px);
+      --safe-r: env(safe-area-inset-right, 0px);
+    }
+
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--ink);
+      color: var(--ivory);
+      font-family: var(--sans);
+      font-weight: 380;
+      letter-spacing: 0.01em;
+      overflow: hidden;
+      overscroll-behavior: none;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      background:
+        radial-gradient(ellipse 70% 50% at 50% 42%, rgba(198, 161, 90, 0.07), transparent 60%),
+        var(--ink);
+    }
+
+    #gl {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      z-index: 1;
+      background: var(--ink);
+    }
+
+    /* Hidden source. display:none would stop frames on some browsers. */
+    #cam {
+      position: fixed;
+      width: 2px;
+      height: 2px;
+      left: 0;
+      top: 0;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    body[data-path="css"] #cam {
+      width: 100%;
+      height: 100%;
+      opacity: 1;
+      object-fit: cover;
+      z-index: 1;
+    }
+
+    body[data-path="css"] #gl { display: none; }
+
+    #patternView {
+      display: none;
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      z-index: 1;
+      background: var(--ink);
+    }
+    body[data-path="css"][data-source="pattern"] #patternView { display: block; }
+    body[data-path="css"][data-source="pattern"] #cam {
+      width: 2px;
+      height: 2px;
+      opacity: 0;
+    }
+
+    /* CSS-filter fallback overlays. Approximate only — no color matrix. */
+    #vignette, #scotoma {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    body[data-path="css"][data-group="tunnel"] #vignette {
+      display: block;
+      background: radial-gradient(circle at center,
+        transparent 0%,
+        transparent 28%,
+        rgba(0, 0, 0, 0.45) 46%,
+        #000 68%);
+    }
+
+    body[data-path="css"][data-group="peripheral"] #vignette {
+      display: block;
+      background: radial-gradient(circle at center,
+        transparent 0%,
+        transparent 9%,
+        #000 16%);
+    }
+
+    body[data-path="css"][data-group="central"] #scotoma {
+      display: block;
+      backdrop-filter: blur(16px) brightness(0.72);
+      -webkit-backdrop-filter: blur(16px) brightness(0.72);
+      -webkit-mask-image: radial-gradient(circle at center, #000 0%, #000 9%, transparent 24%);
+      mask-image: radial-gradient(circle at center, #000 0%, #000 9%, transparent 24%);
+      background: radial-gradient(circle at center, rgba(12, 10, 8, 0.35), transparent 26%);
+    }
+
+    body[data-path="css"][data-group="normal"] #cam,
+    body[data-path="css"][data-group="normal"] #patternView { filter: none; }
+    body[data-path="css"][data-group="tunnel"] #cam,
+    body[data-path="css"][data-group="tunnel"] #patternView { filter: brightness(0.85) contrast(1.04); }
+    body[data-path="css"][data-group="peripheral"] #cam,
+    body[data-path="css"][data-group="peripheral"] #patternView { filter: brightness(0.7) contrast(1.08); }
+    body[data-path="css"][data-group="central"] #cam,
+    body[data-path="css"][data-group="central"] #patternView { filter: none; }
+    body[data-path="css"][data-group="night"] #cam,
+    body[data-path="css"][data-group="night"] #patternView { filter: brightness(0.4) saturate(0.3) blur(1.6px); }
+    body[data-path="css"][data-group="light"] #cam,
+    body[data-path="css"][data-group="light"] #patternView { filter: brightness(1.55) contrast(1.4); }
+    /* Color matrices are not faked in CSS. A wrong filter would be misleading. */
+    body[data-path="css"][data-group="color"] #cam,
+    body[data-path="css"][data-group="color"] #patternView { filter: none; }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 3;
+      pointer-events: none;
+    }
+
+    #overlay button,
+    #overlay input,
+    #overlay summary,
+    #overlay a,
+    #overlay label,
+    .gate,
+    .dock,
+    .banner {
+      pointer-events: auto;
+    }
+
+    button, input, summary { font: inherit; color: inherit; }
+    button {
+      cursor: pointer;
+      border-radius: 2px;
+    }
+    button:focus-visible, input:focus-visible, summary:focus-visible {
+      outline: 2px solid var(--brass);
+      outline-offset: 2px;
+    }
+
+    .topbar {
+      position: absolute;
+      top: calc(12px + var(--safe-t));
+      left: calc(12px + var(--safe-l));
+      right: calc(12px + var(--safe-r));
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding-right: 108px;
+      pointer-events: none;
+    }
+
+    .brand, .mode-wrap, .fps {
+      background: var(--plate);
+      border: 1px solid var(--line);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px 7px 8px;
+    }
+
+    .brand svg { display: block; color: var(--brass); }
+    .brand .word {
+      font-family: var(--serif);
+      font-weight: 620;
+      font-size: 18px;
+      letter-spacing: 0.14em;
+      line-height: 1;
+    }
+    .brand small {
+      display: block;
+      margin-top: 2px;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .mode-wrap {
+      flex: 1 1 auto;
+      padding: 7px 12px 8px;
+      min-width: 0;
+    }
+    .mode-kicker {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--brass-2);
+    }
+    .live-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--dim);
+      display: inline-block;
+    }
+    body[data-live="1"] .live-dot {
+      background: var(--live);
+      animation: pulse 1.8s ease-out infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(214, 69, 50, 0.55); }
+      100% { box-shadow: 0 0 0 8px rgba(214, 69, 50, 0); }
+    }
+    #modeLabel {
+      font-family: var(--serif);
+      font-size: 18px;
+      font-weight: 520;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+      margin-top: 2px;
+    }
+    #sourceChip {
+      margin-top: 3px;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 46vw;
+    }
+    #glareChip {
+      display: inline-block;
+      margin-left: 6px;
+      color: var(--warn);
+      letter-spacing: 0.12em;
+    }
+
+    .fps {
+      position: absolute;
+      top: 0;
+      right: 0;
+      margin: 0;
+      padding: 8px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ok);
+      white-space: nowrap;
+    }
+    .fps.mid { color: var(--warn); }
+    .fps.low { color: var(--bad); }
+
+    .banner {
+      position: absolute;
+      top: calc(78px + var(--safe-t));
+      left: 50%;
+      transform: translateX(-50%);
+      width: min(560px, calc(100% - 24px));
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 10px 10px 10px 12px;
+      background: var(--plate);
+      border: 1px solid var(--line-strong);
+      color: var(--ivory);
+      font-size: 14px;
+      line-height: 1.35;
+    }
+    .banner[data-kind="error"] { border-color: var(--bad); }
+    .banner[data-kind="warn"] { border-color: var(--warn); }
+    .banner button {
+      margin-left: auto;
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1;
+      padding: 0 4px;
+    }
+
+    .lens {
+      position: absolute;
+      left: max(46%, 280px);
+      top: 34%;
+      width: min(72vw, 560px);
+      transform: translate(-50%, -50%);
+      color: var(--brass);
+      opacity: 0.22;
+      pointer-events: none;
+    }
+    body[data-live="1"] .lens { display: none; }
+
+    .gate {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: flex-end;
+      padding: calc(88px + var(--safe-t)) calc(20px + var(--safe-r)) calc(28px + var(--safe-b)) calc(22px + var(--safe-l));
+    }
+    .gate-card { width: min(520px, 100%); }
+    .eyebrow {
+      margin: 0;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--brass-2);
+    }
+    .eyebrow::after {
+      content: "";
+      display: block;
+      width: 52px;
+      height: 1px;
+      margin-top: 12px;
+      background: var(--brass);
+    }
+    .gate h1 {
+      margin: 8px 0 10px;
+      font-family: var(--serif);
+      font-weight: 520;
+      font-size: clamp(64px, 16vw, 104px);
+      line-height: 0.84;
+      letter-spacing: -0.035em;
+    }
+    .lede {
+      margin: 0 0 18px;
+      max-width: 38ch;
+      font-size: 16px;
+      line-height: 1.45;
+      color: var(--ivory);
+    }
+    .gate-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .btn-primary, .btn-ghost, .btn-text {
+      min-height: 48px;
+      padding: 0 16px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 12px;
+      font-weight: 640;
+    }
+    .btn-primary {
+      background: var(--ivory);
+      color: var(--ink);
+      border: 1px solid var(--ivory);
+    }
+    .btn-primary:disabled { opacity: 0.6; }
+    .btn-ghost {
+      background: transparent;
+      color: var(--ivory);
+      border: 1px solid var(--line-strong);
+    }
+    .btn-text {
+      background: transparent;
+      border: 0;
+      padding: 0;
+      min-height: 32px;
+      letter-spacing: 0.06em;
+      text-transform: none;
+      font-weight: 500;
+      font-size: 13px;
+      color: var(--brass-2);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+    .note {
+      margin: 8px 0 0;
+      max-width: 46ch;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .dock {
+      position: absolute;
+      left: calc(12px + var(--safe-l));
+      right: calc(12px + var(--safe-r));
+      bottom: calc(12px + var(--safe-b));
+      max-height: min(48vh, 430px);
+      overflow: auto;
+      background: var(--plate);
+      border: 1px solid var(--line);
+      border-top: 3px solid var(--brass);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
+      padding: 12px;
+    }
+    /* Headset DOM overlay: backdrop-filter has blacked out the HUD on some
+       Quest builds, so the plate is a solid translucent color on purpose. */
+
+    .dock-head {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    #modeDesc {
+      margin: 0;
+      font-size: 13.5px;
+      line-height: 1.4;
+      color: var(--ivory);
+      max-width: 62ch;
+    }
+    #btnCollapse {
+      flex: 0 0 auto;
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      min-height: 32px;
+      padding: 0 8px;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .modes {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    .modes button {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      text-align: left;
+      padding: 9px 10px;
+      background: transparent;
+      color: var(--ivory);
+      border: 1px solid rgba(214, 196, 168, 0.22);
+      min-height: 44px;
+    }
+    .modes button .idx {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      color: var(--brass);
+    }
+    .modes button .name { font-size: 14px; }
+    .modes button[aria-pressed="true"] {
+      background: var(--ivory);
+      color: var(--ink);
+      border-color: var(--ivory);
+    }
+    .modes button[aria-pressed="true"] .idx { color: #8a6230; }
+
+    .subs, .tools, .sliders, .swatches {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .subs button, .tools button {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--ivory);
+      min-height: 36px;
+      padding: 0 10px;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+    }
+    .subs button[aria-pressed="true"],
+    .tools button[aria-pressed="true"] {
+      border-color: var(--brass);
+      color: var(--brass-2);
+    }
+
+    .sliders { display: block; }
+    .sliders label {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 2px 10px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+    }
+    .sliders output {
+      font-family: var(--mono);
+      color: var(--brass-2);
+    }
+    .sliders input[type="range"] {
+      grid-column: 1 / -1;
+      width: 100%;
+      appearance: none;
+      -webkit-appearance: none;
+      height: 2px;
+      background: rgba(214, 196, 168, 0.35);
+      border: 0;
+      padding: 10px 0;
+      margin: 0;
+    }
+    .sliders input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--ivory);
+      border: 2px solid var(--brass);
+    }
+    .sliders input[type="range"]::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--ivory);
+      border: 2px solid var(--brass);
+    }
+
+    .swatch {
+      width: 18px;
+      height: 18px;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+    }
+    .swatch-note {
+      flex: 1 0 100%;
+      margin: 0;
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0.03em;
+    }
+
+    details.more {
+      margin-top: 10px;
+      border-top: 1px solid rgba(214, 196, 168, 0.16);
+      padding-top: 8px;
+    }
+    details.more summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .more-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .foot {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin: 10px 0 0;
+      color: var(--dim);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .keys { font-family: var(--mono); letter-spacing: 0.03em; }
+
+    #shaderDump {
+      position: absolute;
+      inset: 80px 12px 12px;
+      overflow: auto;
+      background: rgba(12, 10, 8, 0.96);
+      color: var(--ivory);
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: pre-wrap;
+      padding: 12px;
+      z-index: 6;
+      pointer-events: auto;
+      border: 1px solid var(--line);
+    }
+
+    @media (min-width: 900px) {
+      .gate { align-items: center; padding-left: 7vw; }
+      .dock {
+        left: auto;
+        top: calc(78px + var(--safe-t));
+        bottom: calc(16px + var(--safe-b));
+        right: calc(16px + var(--safe-r));
+        width: 360px;
+        max-height: none;
+      }
+      .modes { grid-template-columns: 1fr; }
+      #sourceChip { max-width: 180px; }
+    }
+
+    @media (max-width: 420px) {
+      .brand small { display: none; }
+      #modeLabel { font-size: 16px; }
+    }
+
+    @media (pointer: coarse) {
+      .keys { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; transition: none !important; }
+    }
+
+    @media (forced-colors: active) {
+      button, .dock, .brand, .fps, .mode-wrap { border: 1px solid ButtonText; }
+    }
+  </style>
+</head>
+<body data-path="webgl" data-group="normal" data-mode="normal" data-live="0">
+  <video id="cam" playsinline muted autoplay webkit-playsinline disablepictureinpicture aria-hidden="true"></video>
+  <canvas id="gl" aria-hidden="true"></canvas>
+  <div id="vignette" aria-hidden="true"></div>
+  <div id="scotoma" aria-hidden="true"></div>
+
+  <div id="overlay">
+    <svg class="lens" viewBox="0 0 200 120" fill="none" aria-hidden="true">
+      <path d="M8 60C36 22 70 8 100 8s64 14 92 52c-28 38-56 52-92 52S36 98 8 60z" stroke="currentColor" stroke-width="1.2"/>
+      <circle cx="100" cy="60" r="22" stroke="currentColor" stroke-width="1.2"/>
+      <circle cx="100" cy="60" r="8" fill="currentColor"/>
+      <path d="M100 4v14M100 102v14M4 60h16M180 60h16" stroke="currentColor" stroke-width="1"/>
+    </svg>
+
+    <header class="topbar">
+      <div class="brand">
+        <svg width="28" height="16" viewBox="0 0 32 18" aria-hidden="true">
+          <path d="M1 9C6 3 11 1 16 1s10 2 15 8c-5 6-10 8-15 8S6 15 1 9z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <circle cx="16" cy="9" r="3.2" fill="currentColor"/>
+        </svg>
+        <div>
+          <div class="word">VISION</div>
+          <small>Simulator</small>
+        </div>
+      </div>
+      <div class="mode-wrap">
+        <div class="mode-kicker"><i class="live-dot" aria-hidden="true"></i> <span id="liveWord">Standby</span><span id="glareChip" hidden>Glare</span></div>
+        <div id="modeLabel" aria-live="polite">Normal</div>
+        <div id="sourceChip">No source yet</div>
+      </div>
+      <div id="fps" class="fps" aria-live="off">— FPS</div>
+    </header>
+
+    <div id="banner" class="banner" hidden role="status">
+      <span id="bannerText"></span>
+      <button type="button" id="bannerClose" aria-label="Dismiss message">×</button>
+    </div>
+
+    <div id="gate" class="gate">
+      <div class="gate-card">
+        <p class="eyebrow">Real-time optical instrument</p>
+        <h1>VISION</h1>
+        <p class="lede">The room you are in, through a live shader. Six vision conditions, updated every frame. Nothing is recorded.</p>
+        <div class="gate-actions">
+          <button type="button" class="btn-primary" id="btnAR" hidden>Enter AR</button>
+          <button type="button" class="btn-ghost" id="btnCam">Start camera</button>
+        </div>
+        <button type="button" class="btn-text" id="btnPattern">No camera? Preview with a test pattern</button>
+        <p id="gateNote" class="note">Checking this device…</p>
+      </div>
+    </div>
+
+    <div id="dock" class="dock" hidden>
+      <div class="dock-head">
+        <p id="modeDesc"></p>
+        <button type="button" id="btnCollapse" aria-expanded="true">Hide</button>
+      </div>
+      <div id="panelBody">
+        <div class="modes" role="group" aria-label="Vision condition">
+          <button type="button" data-mode="normal" aria-pressed="true"><span class="idx">01</span><span class="name">Normal</span></button>
+          <button type="button" data-mode="tunnel" aria-pressed="false"><span class="idx">02</span><span class="name">Tunnel vision</span></button>
+          <button type="button" data-mode="central" aria-pressed="false"><span class="idx">03</span><span class="name">Central loss</span></button>
+          <button type="button" data-mode="peripheral" aria-pressed="false"><span class="idx">04</span><span class="name">Peripheral loss</span></button>
+          <button type="button" data-mode="color" aria-pressed="false"><span class="idx">05</span><span class="name">Color vision</span></button>
+          <button type="button" data-mode="night" aria-pressed="false"><span class="idx">06</span><span class="name">Night blindness</span></button>
+          <button type="button" data-mode="light" aria-pressed="false"><span class="idx">07</span><span class="name">Light sensitivity</span></button>
+        </div>
+
+        <div id="subColor" class="subs" hidden>
+          <button type="button" data-mode="deuteranopia" aria-pressed="true">Deuteranopia</button>
+          <button type="button" data-mode="protanopia" aria-pressed="false">Protanopia</button>
+          <button type="button" data-mode="tritanopia" aria-pressed="false">Tritanopia</button>
+        </div>
+
+        <div id="ctrlTunnel" class="sliders" hidden>
+          <label>Clear radius <output id="outTunnelR">0.35</output>
+            <input id="slTunnelR" type="range" min="0.10" max="0.70" step="0.01" value="0.35" aria-label="Tunnel clear radius">
+          </label>
+          <label>Edge softness <output id="outTunnelF">0.18</output>
+            <input id="slTunnelF" type="range" min="0.01" max="0.40" step="0.01" value="0.18" aria-label="Tunnel edge softness">
+          </label>
+        </div>
+        <div id="ctrlPeripheral" class="sliders" hidden>
+          <label>Clear radius <output id="outPeriphR">0.17</output>
+            <input id="slPeriphR" type="range" min="0.06" max="0.40" step="0.01" value="0.17" aria-label="Peripheral clear radius">
+          </label>
+          <label>Edge softness <output id="outPeriphF">0.04</output>
+            <input id="slPeriphF" type="range" min="0.005" max="0.20" step="0.005" value="0.04" aria-label="Peripheral edge softness">
+          </label>
+        </div>
+        <div id="ctrlCentral" class="sliders" hidden>
+          <label>Scotoma radius <output id="outCentralR">0.20</output>
+            <input id="slCentralR" type="range" min="0.06" max="0.45" step="0.01" value="0.20" aria-label="Central scotoma radius">
+          </label>
+          <label>Blur spacing <output id="outCentralB">8</output>
+            <input id="slCentralB" type="range" min="2" max="24" step="1" value="8" aria-label="Central blur spacing in pixels">
+          </label>
+          <label>Core darken <output id="outCentralD">0.32</output>
+            <input id="slCentralD" type="range" min="0" max="0.85" step="0.01" value="0.32" aria-label="Central darken amount">
+          </label>
+        </div>
+        <div id="ctrlNight" class="sliders" hidden>
+          <label>Darkness override <output id="outNightF">0.00</output>
+            <input id="slNightF" type="range" min="0" max="1" step="0.01" value="0" aria-label="Night blindness darkness override">
+          </label>
+          <label>Dim factor <output id="outNightD">0.42</output>
+            <input id="slNightD" type="range" min="0.2" max="0.7" step="0.01" value="0.42" aria-label="Night blindness dim factor">
+          </label>
+        </div>
+        <div id="ctrlLight" class="sliders" hidden>
+          <label>Highlight threshold <output id="outLightT">0.60</output>
+            <input id="slLightT" type="range" min="0.35" max="0.9" step="0.01" value="0.60" aria-label="Photophobia highlight threshold">
+          </label>
+          <label>Glow strength <output id="outLightG">1.15</output>
+            <input id="slLightG" type="range" min="0" max="2.5" step="0.05" value="1.15" aria-label="Photophobia glow strength">
+          </label>
+        </div>
+
+        <div id="chartLegend" class="swatches" hidden>
+          <p class="swatch-note">True color in the panel. The chart inside the image is run through the shader.</p>
+        </div>
+
+        <div class="tools">
+          <button type="button" id="btnCompare" aria-pressed="false">Hold to compare</button>
+          <button type="button" id="btnChart" aria-pressed="false">Test chart</button>
+          <button type="button" id="btnXRCam" hidden>Use device camera</button>
+          <button type="button" id="btnRetryXR" hidden>Retry AR camera</button>
+          <button type="button" id="btnExitAR" hidden>Exit AR</button>
+        </div>
+
+        <details class="more">
+          <summary>Image and performance</summary>
+          <div class="more-row">
+            <button type="button" id="btnMirror" aria-pressed="false">Mirror</button>
+            <button type="button" id="btnFlip" aria-pressed="false">Flip</button>
+            <button type="button" id="btnRound" aria-pressed="true">Circular field</button>
+            <button type="button" id="btnQuality">Quality: balanced</button>
+            <button type="button" id="btnReset">Reset sliders</button>
+            <button type="button" id="btnStop">Stop</button>
+          </div>
+        </details>
+        <p class="foot">
+          <span>Educational simulation. Not a medical device.</span>
+          <span class="keys">1–7 modes · C compare</span>
+        </p>
+      </div>
+    </div>
+    <button type="button" id="btnShow" class="btn-ghost" hidden style="position:absolute;left:12px;bottom:calc(12px + env(safe-area-inset-bottom));">Controls</button>
+    <pre id="shaderDump" hidden></pre>
+  </div>
+
+  <noscript>VISION needs JavaScript to run the live camera shader.</noscript>
+
+  <script>
+    /* ============================================================
+       VISION
+       One WebGL pipeline. Webcam frames and WebXR camera textures
+       are both sampled by the same precompiled fragment shaders.
+       setMode() never recompiles — it swaps the active program.
+       ============================================================ */
+
+    let currentMode = 'normal';
+
+    const canvas = document.getElementById('gl');
+    const video = document.getElementById('cam');
+    const overlay = document.getElementById('overlay');
+    const els = {
+      gate: document.getElementById('gate'),
+      gateNote: document.getElementById('gateNote'),
+      dock: document.getElementById('dock'),
+      panelBody: document.getElementById('panelBody'),
+      btnAR: document.getElementById('btnAR'),
+      btnCam: document.getElementById('btnCam'),
+      btnPattern: document.getElementById('btnPattern'),
+      btnCollapse: document.getElementById('btnCollapse'),
+      btnShow: document.getElementById('btnShow'),
+      btnCompare: document.getElementById('btnCompare'),
+      btnChart: document.getElementById('btnChart'),
+      btnMirror: document.getElementById('btnMirror'),
+      btnFlip: document.getElementById('btnFlip'),
+      btnRound: document.getElementById('btnRound'),
+      btnQuality: document.getElementById('btnQuality'),
+      btnReset: document.getElementById('btnReset'),
+      btnStop: document.getElementById('btnStop'),
+      btnExitAR: document.getElementById('btnExitAR'),
+      btnXRCam: document.getElementById('btnXRCam'),
+      btnRetryXR: document.getElementById('btnRetryXR'),
+      modeLabel: document.getElementById('modeLabel'),
+      modeDesc: document.getElementById('modeDesc'),
+      sourceChip: document.getElementById('sourceChip'),
+      liveWord: document.getElementById('liveWord'),
+      fps: document.getElementById('fps'),
+      glareChip: document.getElementById('glareChip'),
+      banner: document.getElementById('banner'),
+      bannerText: document.getElementById('bannerText'),
+      subColor: document.getElementById('subColor'),
+      chartLegend: document.getElementById('chartLegend'),
+      shaderDump: document.getElementById('shaderDump')
+    };
+
+    /* Clinical simulation matrices, row form as specified.
+       JS uploads them column-major because WebGL's uniformMatrix3fv
+       requires transpose = false and GLSL mat3 is column-major.
+
+       Protanopia:   R' = 0.567R + 0.433G + 0.000B
+                     G' = 0.558R + 0.442G + 0.000B
+                     B' = 0.000R + 0.242G + 0.758B
+       Deuteranopia: R' = 0.625R + 0.375G + 0.000B
+                     G' = 0.700R + 0.300G + 0.000B
+                     B' = 0.000R + 0.300G + 0.700B
+       Tritanopia:   R' = 0.950R + 0.050G + 0.000B
+                     G' = 0.000R + 0.433G + 0.567B
+                     B' = 0.000R + 0.475G + 0.525B
+    */
+    const MATRICES = {
+      protanopia: new Float32Array([
+        0.567, 0.558, 0.000,
+        0.433, 0.442, 0.242,
+        0.000, 0.000, 0.758
+      ]),
+      deuteranopia: new Float32Array([
+        0.625, 0.700, 0.000,
+        0.375, 0.300, 0.300,
+        0.000, 0.000, 0.700
+      ]),
+      tritanopia: new Float32Array([
+        0.950, 0.000, 0.000,
+        0.050, 0.433, 0.475,
+        0.000, 0.567, 0.525
+      ])
+    };
+
+    const CHART_COLORS = [
+      [0.86, 0.08, 0.08],
+      [0.12, 0.62, 0.24],
+      [0.95, 0.82, 0.08],
+      [0.11, 0.31, 0.85],
+      [0.95, 0.45, 0.08],
+      [0.48, 0.22, 0.78],
+      [0.05, 0.70, 0.78],
+      [0.55, 0.55, 0.55]
+    ];
+    const CHART_NAMES = ['Red', 'Green', 'Yellow', 'Blue', 'Orange', 'Purple', 'Cyan', 'Gray'];
+
+    const MODE_INFO = {
+      normal: {
+        label: 'Normal',
+        program: 'normal',
+        group: 'normal',
+        desc: 'Baseline. The camera is drawn with an identity shader — no simulation.'
+      },
+      tunnel: {
+        label: 'Tunnel vision',
+        program: 'tunnel',
+        group: 'tunnel',
+        desc: 'A narrowed field with a soft edge, as in mid-stage retinitis pigmentosa. The center stays clear. The periphery falls to black.'
+      },
+      central: {
+        label: 'Central vision loss',
+        program: 'central',
+        group: 'central',
+        desc: 'Macular-degeneration style. Fixation is a blurred, slightly dim scotoma. The periphery stays sharp. This is not a hard black disc.'
+      },
+      peripheral: {
+        label: 'Peripheral vision loss',
+        program: 'tunnel',
+        group: 'peripheral',
+        desc: 'The same tunnel shader with a smaller radius and a hard cutoff — advanced glaucoma or retinitis pigmentosa. The clear island is abrupt.'
+      },
+      color: {
+        label: 'Color vision',
+        program: 'color',
+        group: 'color',
+        desc: 'Cone-response matrices. Deuteranopia is the default.'
+      },
+      deuteranopia: {
+        label: 'Deuteranopia',
+        program: 'color',
+        group: 'color',
+        desc: 'Missing M-cones. Reds and greens collapse toward yellow-olive. Applied as a mat3 multiply on the camera color, not a hue shift.'
+      },
+      protanopia: {
+        label: 'Protanopia',
+        program: 'color',
+        group: 'color',
+        desc: 'Missing L-cones. Reds darken and shift toward olive. Greens and reds are harder to separate. Same mat3 path, different matrix.'
+      },
+      tritanopia: {
+        label: 'Tritanopia',
+        program: 'color',
+        group: 'color',
+        desc: 'Missing S-cones. Blues and yellows collapse. The world shifts toward red and cyan. Same mat3 path, different matrix.'
+      },
+      night: {
+        label: 'Night blindness',
+        program: 'night',
+        group: 'night',
+        desc: 'Nyctalopia. Dims, desaturates, and softens the image. The effect strengthens when the frame itself is dark, and stays minimal in bright light. Camera auto-exposure can hide a dark room — raise Darkness override to demonstrate.'
+      },
+      light: {
+        label: 'Light sensitivity',
+        program: 'light',
+        group: 'light',
+        desc: 'Photophobia. Highlights overexpose and throw a white halo. A jump in frame brightness spikes the glare, then eases off over one second.'
+      }
+    };
+
+    const modeParams = {
+      tunnel: { radius: 0.35, falloff: 0.18 },
+      peripheral: { radius: 0.17, falloff: 0.04 },
+      central: { radius: 0.20, blur: 8, darken: 0.32 },
+      night: { dim: 0.42, desat: 0.70, blur: 2.5, force: 0 },
+      light: { threshold: 0.60, boost: 1.85, contrast: 1.50, glow: 1.15 }
+    };
+    const DEFAULT_PARAMS = JSON.parse(JSON.stringify(modeParams));
+
+    let colorSub = 'deuteranopia';
+    let renderPath = 'webgl';
+    let gl = null;
+    let programs = {};
+    let quadBuffer = null;
+    let videoTexture = null;
+    let sourceType = 'none';
+    let sourceW = 0;
+    let sourceH = 0;
+    let stream = null;
+    let userMirror = false;
+    let userFlip = false;
+    let circularField = true;
+    let chartOn = false;
+    let chartUserSet = false;
+    let comparing = false;
+    let dprCap = 1.5;
+    let qualityName = 'balanced';
+    let frameLuma = -1;
+    let spikeLevel = 0;
+    let spikeArmed = true;
+    let spikeStart = 0;
+    let fpsFrames = 0;
+    let fpsStamp = performance.now();
+    let fpsValue = 0;
+    let loopOn = false;
+    let xrSession = null;
+    let xrRefSpace = null;
+    let glBinding = null;
+    let xrCameraSeen = false;
+    let xrFrames = 0;
+    let xrWarned = false;
+    let readback = null;
+    let readbackFailed = false;
+    let glErrorShown = false;
+    let bannerTimer = 0;
+    let autoTried = false;
+    let arSupported = false;
+    let arClicks = 0;
+    let lastChipText = '';
+
+    const patternCanvas = document.createElement('canvas');
+    patternCanvas.id = 'patternView';
+    patternCanvas.width = 960;
+    patternCanvas.height = 540;
+    patternCanvas.setAttribute('aria-hidden', 'true');
+    document.body.insertBefore(patternCanvas, canvas);
+    const patternCtx = patternCanvas.getContext('2d', { alpha: false });
+
+    const lumaCanvas = document.createElement('canvas');
+    lumaCanvas.width = 32;
+    lumaCanvas.height = 18;
+    const lumaCtx = lumaCanvas.getContext('2d', { willReadFrequently: true, alpha: false });
+
+    /* ---------- shader construction ---------- */
+
+    const VERT = [
+      'attribute vec2 a_pos;',
+      'attribute vec2 a_uv;',
+      'varying vec2 v_uv;',
+      'void main() {',
+      '  v_uv = a_uv;',
+      '  gl_Position = vec4(a_pos, 0.0, 1.0);',
+      '}'
+    ].join('\n');
+
+    function chartGLSL() {
+      const n = CHART_COLORS.length;
+      const lines = ['  vec3 col = vec3(0.0);'];
+      CHART_COLORS.forEach(function (rgb, i) {
+        const rhs = 'col = vec3(' + rgb[0].toFixed(3) + ', ' + rgb[1].toFixed(3) + ', ' + rgb[2].toFixed(3) + ');';
+        if (i === 0) lines.push('  if (t < ' + ((i + 1) / n).toFixed(4) + ') ' + rhs);
+        else if (i === n - 1) lines.push('  else ' + rhs);
+        else lines.push('  else if (t < ' + ((i + 1) / n).toFixed(4) + ') ' + rhs);
+      });
+      return lines.join('\n');
+    }
+
+    function unrollBox(radius) {
+      const lines = [];
+      let n = 0;
+      for (let j = -radius; j <= radius; j++) {
+        for (let i = -radius; i <= radius; i++) {
+          lines.push('  acc += sceneColor(uv + vec2(' + i.toFixed(1) + ', ' + j.toFixed(1) + ') * step);');
+          n++;
+        }
+      }
+      return { body: lines.join('\n'), n: n };
+    }
+
+    const BOX5 = unrollBox(2);
+    const BOX3 = unrollBox(1);
+
+    /* Shared sampling math. Included in every fragment program so AR and
+       webcam cannot drift apart. Mode-specific math lives below. */
+    const PRELUDE = [
+      '#ifdef GL_FRAGMENT_PRECISION_HIGH',
+      'precision highp float;',
+      '#else',
+      'precision mediump float;',
+      '#endif',
+      'varying vec2 v_uv;',
+      'uniform sampler2D u_tex;',
+      'uniform vec2 u_uvScale;',
+      'uniform vec2 u_uvOffset;',
+      'uniform float u_flipY;',
+      'uniform float u_mirror;',
+      'uniform float u_aspect;',
+      'uniform vec2 u_texel;',
+      'uniform float u_frameLuma;',
+      'uniform float u_chart;',
+      '',
+      'vec2 texCoord(vec2 screenUV) {',
+      '  vec2 t = screenUV * u_uvScale + u_uvOffset;',
+      '  if (u_mirror > 0.5) t.x = 1.0 - t.x;',
+      '  if (u_flipY > 0.5) t.y = 1.0 - t.y;',
+      '  return clamp(t, 0.001, 0.999);',
+      '}',
+      '',
+      'float luma(vec3 c) {',
+      '  /* Rec. 709. Used for desaturation, glare threshold, and scene brightness. */',
+      '  return dot(c, vec3(0.2126, 0.7152, 0.0722));',
+      '}',
+      '',
+      '/* Reference chart + fixation cross, in screen space, BEFORE the effect',
+      '   so the active condition transforms it. Alpha 0 means "not on the chart". */',
+      'vec4 referenceChart(vec2 uv) {',
+      '  vec2 d = uv - vec2(0.5);',
+      '  d.x *= u_aspect;',
+      '  /* Dark cross with an ivory edge so fixation reads on any background. */',
+      '  float arm = 0.020;',
+      '  float thick = 0.005;',
+      '  float inner = 0.0022;',
+      '  if ((abs(d.x) < thick && abs(d.y) < arm) || (abs(d.y) < thick && abs(d.x) < arm)) {',
+      '    if ((abs(d.x) < inner && abs(d.y) < arm) || (abs(d.y) < inner && abs(d.x) < arm)) {',
+      '      return vec4(0.08, 0.07, 0.06, 1.0);',
+      '    }',
+      '    return vec4(0.98, 0.95, 0.88, 1.0);',
+      '  }',
+      '  float halfW = 0.15 / max(u_aspect, 0.25);',
+      '  if (abs(uv.x - 0.5) > halfW || uv.y < 0.55 || uv.y > 0.67) return vec4(0.0);',
+      '  float t = (uv.x - (0.5 - halfW)) / (2.0 * halfW);',
+      '  float edge = min(min(t, 1.0 - t), min((uv.y - 0.55) / 0.12, (0.67 - uv.y) / 0.12));',
+      '  if (edge < 0.08) return vec4(0.96, 0.94, 0.90, 1.0);',
+      '  float cell = fract(t * 8.0);',
+      '  if (cell < 0.045 || cell > 0.955) return vec4(0.08, 0.07, 0.06, 1.0);',
+      chartGLSL(),
+      '  return vec4(col, 1.0);',
+      '}',
+      '',
+      'vec3 sceneColor(vec2 uv) {',
+      '  /* Sample first so the texture fetch is not inside a per-pixel branch.',
+      '     WebGL1 mip derivatives are undefined in divergent flow; we also',
+      '     use a non-mip filter, but keeping the fetch uniform is safer. */',
+      '  vec3 tex = texture2D(u_tex, texCoord(clamp(uv, 0.0, 1.0))).rgb;',
+      '  if (u_chart > 0.5) {',
+      '    vec4 chart = referenceChart(uv);',
+      '    if (chart.a > 0.5) return chart.rgb;',
+      '  }',
+      '  return tex;',
+      '}',
+      '',
+      '/* Spec formula, written exactly:',
+      '     float dist = distance(uv, vec2(0.5));',
+      '   u_aspect scales X first so the disc is circular in pixels',
+      '   (visual fields are round; raw UV distance is an ellipse on a phone).',
+      '   Set Circular field off to force u_aspect = 1 and use the raw formula. */',
+      'float centerDist(vec2 uv) {',
+      '  vec2 p = uv;',
+      '  p.x = (p.x - 0.5) * u_aspect + 0.5;',
+      '  float dist = distance(p, vec2(0.5));',
+      '  return dist;',
+      '}'
+    ].join('\n');
+
+    function buildShaders() {
+      const normal = PRELUDE + [
+        'void main() {',
+        '  gl_FragColor = vec4(sceneColor(v_uv), 1.0);',
+        '}'
+      ].join('\n');
+
+      /* Tunnel and peripheral share this program.
+         darkness = smoothstep(tunnelRadius, tunnelRadius + falloff, dist)
+         which is the spec's smoothstep(0.25, 0.5, dist) with the inner edge
+         driven by the live uniform (default tunnelRadius = 0.35).
+         Peripheral sets a smaller tunnelRadius and a much smaller falloff. */
+      const tunnel = PRELUDE + [
+        'uniform float tunnelRadius;',
+        'uniform float u_falloff;',
+        'void main() {',
+        '  vec2 uv = v_uv;',
+        '  float dist = centerDist(uv);',
+        '  vec3 original = sceneColor(uv);',
+        '  float edge1 = tunnelRadius + max(u_falloff, 0.001);',
+        '  float darkness = smoothstep(tunnelRadius, edge1, dist);',
+        '  vec3 color = mix(original, vec3(0.0), darkness);',
+        '  gl_FragColor = vec4(color, 1.0);',
+        '}'
+      ].join('\n');
+
+      /* Central loss is the tunnel mask inverted, plus a box blur.
+         The blur is unrolled (strict WebGL1). Conceptually:
+           acc = average of sceneColor at a 5x5 grid of view-pixel offsets.
+         Periphery (dist > radius) is the sharp sample, untouched. */
+      const central = PRELUDE + [
+        'uniform float u_radius;',
+        'uniform float u_blurPx;',
+        'uniform float u_darken;',
+        'void main() {',
+        '  vec2 uv = v_uv;',
+        '  float dist = centerDist(uv);',
+        '  vec3 sharp = sceneColor(uv);',
+        '  vec2 step = u_texel * max(u_blurPx, 1.0);',
+        '  vec3 acc = vec3(0.0);',
+        BOX5.body,
+        '  vec3 blurred = acc / ' + BOX5.n.toFixed(1) + ';',
+        '  float inner = u_radius * 0.28;',
+        '  float mask = 1.0 - smoothstep(inner, max(u_radius, inner + 0.001), dist);',
+        '  float core = 1.0 - smoothstep(0.0, max(u_radius * 0.55, 0.001), dist);',
+        '  /* u_darken 0 = pure box blur. Higher values dim the core so the scotoma',
+        '     reads as missing detail, not a hard black disc. Default 0.32. */',
+        '  float dark = clamp(u_darken, 0.0, 1.0);',
+        '  vec3 crushed = mix(blurred, vec3(luma(blurred) * 0.42), dark);',
+        '  vec3 spot = mix(blurred, crushed, core);',
+        '  spot = mix(spot, vec3(0.04, 0.035, 0.032), dark * 0.55 * mask);',
+        '  gl_FragColor = vec4(mix(sharp, spot, mask), 1.0);',
+        '}'
+      ].join('\n');
+
+      const color = PRELUDE + [
+        'uniform mat3 u_matrix;',
+        'void main() {',
+        '  vec3 c = sceneColor(v_uv);',
+        '  /* Column-major mat3 times RGB. Rows of the clinical matrix are output channels. */',
+        '  vec3 t = clamp(u_matrix * c, 0.0, 1.0);',
+        '  gl_FragColor = vec4(t, 1.0);',
+        '}'
+      ].join('\n');
+
+      const night = PRELUDE + [
+        'uniform float u_dim;',
+        'uniform float u_desat;',
+        'uniform float u_blurPx;',
+        'uniform float u_force;',
+        'uniform float u_bright;',
+        'uniform float u_dark;',
+        'float sceneLuma() {',
+        '  if (u_frameLuma >= 0.0) return u_frameLuma;',
+        '  /* Fallback if JS has not sampled the frame yet: 4x4 grid, not a full reduce. */',
+        '  float s = 0.0;',
+        '  s += luma(texture2D(u_tex, vec2(0.20, 0.25)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.40, 0.25)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.60, 0.25)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.80, 0.25)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.20, 0.50)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.40, 0.50)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.60, 0.50)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.80, 0.50)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.20, 0.75)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.40, 0.75)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.60, 0.75)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.80, 0.75)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.30, 0.38)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.70, 0.38)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.30, 0.62)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.70, 0.62)).rgb);',
+        '  return s / 16.0;',
+        '}',
+        'void main() {',
+        '  vec2 uv = v_uv;',
+        '  vec3 sharp = sceneColor(uv);',
+        '  vec2 step = u_texel * max(u_blurPx, 1.0);',
+        '  vec3 acc = vec3(0.0);',
+        BOX3.body,
+        '  vec3 blurred = acc / ' + BOX3.n.toFixed(1) + ';',
+        '  float scene = sceneLuma();',
+        '  /* smoothstep(bright, dark, scene) is 0 in daylight and 1 in the dark. */',
+        '  float adaptive = smoothstep(u_bright, u_dark, scene);',
+        '  float strength = clamp(max(adaptive, u_force), 0.0, 1.0);',
+        '  vec3 base = mix(sharp, blurred, 0.60 * strength);',
+        '  float y = luma(base);',
+        '  vec3 desat = mix(base, vec3(y), clamp(u_desat, 0.0, 1.0) * strength);',
+        '  /* u_dim defaults to 0.42, inside the requested 0.35–0.5 brightness multiply. */',
+        '  vec3 outC = desat * mix(1.0, clamp(u_dim, 0.05, 1.0), strength);',
+        '  gl_FragColor = vec4(clamp(outC, 0.0, 1.0), 1.0);',
+        '}'
+      ].join('\n');
+
+      const light = PRELUDE + [
+        'uniform float u_threshold;',
+        'uniform float u_boost;',
+        'uniform float u_contrast;',
+        'uniform float u_glow;',
+        'uniform float u_spike;',
+        'uniform float u_glowStep;',
+        'float sceneLuma() {',
+        '  if (u_frameLuma >= 0.0) return u_frameLuma;',
+        '  float s = 0.0;',
+        '  s += luma(texture2D(u_tex, vec2(0.25, 0.30)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.50, 0.30)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.75, 0.30)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.25, 0.55)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.50, 0.55)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.75, 0.55)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.25, 0.78)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.50, 0.78)).rgb);',
+        '  s += luma(texture2D(u_tex, vec2(0.75, 0.78)).rgb);',
+        '  return s / 9.0;',
+        '}',
+        'vec3 bloomTap(vec2 uv, vec2 dir, float scale) {',
+        '  /* Divide X by aspect so the halo is round in pixels, not in UV. */',
+        '  vec2 o = vec2(dir.x / max(u_aspect, 0.001), dir.y) * u_glowStep * scale;',
+        '  vec3 s = sceneColor(uv + o);',
+        '  float excess = max(luma(s) - u_threshold, 0.0);',
+        '  return mix(vec3(excess), s * excess, 0.30);',
+        '}',
+        'void main() {',
+        '  vec2 uv = v_uv;',
+        '  vec3 col = sceneColor(uv);',
+        '  float l = luma(col);',
+        '  float hotEdge = min(u_threshold + 0.22, 0.98);',
+        '  float hot = smoothstep(u_threshold, max(hotEdge, u_threshold + 0.001), l);',
+        '  vec3 exposed = col * mix(1.0, u_boost, hot);',
+        '  vec3 contrasted = (exposed - 0.5) * mix(1.0, u_contrast, hot) + 0.5;',
+        '  vec3 glow = vec3(0.0);',
+        '  glow += bloomTap(uv, vec2( 1.0,  0.0), 1.0);',
+        '  glow += bloomTap(uv, vec2(-1.0,  0.0), 1.0);',
+        '  glow += bloomTap(uv, vec2( 0.0,  1.0), 1.0);',
+        '  glow += bloomTap(uv, vec2( 0.0, -1.0), 1.0);',
+        '  glow += bloomTap(uv, vec2( 0.707,  0.707), 1.0);',
+        '  glow += bloomTap(uv, vec2(-0.707,  0.707), 1.0);',
+        '  glow += bloomTap(uv, vec2( 0.707, -0.707), 1.0);',
+        '  glow += bloomTap(uv, vec2(-0.707, -0.707), 1.0);',
+        '  glow += bloomTap(uv, vec2( 1.0,  0.0), 2.2) * 0.65;',
+        '  glow += bloomTap(uv, vec2(-1.0,  0.0), 2.2) * 0.65;',
+        '  glow += bloomTap(uv, vec2( 0.0,  1.0), 2.2) * 0.65;',
+        '  glow += bloomTap(uv, vec2( 0.0, -1.0), 2.2) * 0.65;',
+        '  glow += bloomTap(uv, vec2( 0.707,  0.707), 2.2) * 0.45;',
+        '  glow += bloomTap(uv, vec2(-0.707,  0.707), 2.2) * 0.45;',
+        '  glow += bloomTap(uv, vec2( 0.707, -0.707), 2.2) * 0.45;',
+        '  glow += bloomTap(uv, vec2(-0.707, -0.707), 2.2) * 0.45;',
+        '  glow /= 12.0;',
+        '  float spike = clamp(u_spike, 0.0, 1.0);',
+        '  vec3 outC = contrasted + glow * u_glow * (1.0 + spike * 2.0);',
+        '  float scene = sceneLuma();',
+        '  /* Veil eases off as JS decays u_spike from 1 to 0 over ~1 second. */',
+        '  float veil = spike * smoothstep(0.42, 0.82, scene) * 0.32;',
+        '  outC = mix(outC, vec3(1.0), veil);',
+        '  float env = smoothstep(0.35, 0.75, scene);',
+        '  outC = mix(outC, outC * 1.12 + 0.04, env * 0.55);',
+        '  gl_FragColor = vec4(clamp(outC, 0.0, 1.0), 1.0);',
+        '}'
+      ].join('\n');
+
+      return { normal: normal, tunnel: tunnel, central: central, color: color, night: night, light: light };
+    }
+
+    const FRAGMENTS = buildShaders();
+
+    /* ---------- WebGL ---------- */
+
+    function createContext() {
+      /* alpha: true so an immersive-ar layer can composite over passthrough.
+         The page path clears to opaque ink, so the HTML background does not show through. */
+      const base = {
+        alpha: true,
+        antialias: false,
+        depth: false,
+        stencil: false,
+        powerPreference: 'high-performance',
+        preserveDrawingBuffer: false,
+        premultipliedAlpha: true
+      };
+      const attempts = [
+        { type: 'webgl', attr: Object.assign({ xrCompatible: true }, base) },
+        { type: 'webgl', attr: base },
+        { type: 'experimental-webgl', attr: { alpha: true, antialias: false, depth: false, stencil: false } }
+      ];
+      for (let i = 0; i < attempts.length; i++) {
+        try {
+          const ctx = canvas.getContext(attempts[i].type, attempts[i].attr);
+          if (ctx) return ctx;
+        } catch (err) {
+          /* try the next attribute set */
+        }
+      }
+      try {
+        return canvas.getContext('webgl');
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function compileShader(type, source, name) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, source);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(sh) || 'unknown compile error';
+        gl.deleteShader(sh);
+        throw new Error(name + ': ' + log);
+      }
+      return sh;
+    }
+
+    function linkProgram(vs, fsSource, name) {
+      const fs = compileShader(gl.FRAGMENT_SHADER, fsSource, name);
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.bindAttribLocation(program, 0, 'a_pos');
+      gl.bindAttribLocation(program, 1, 'a_uv');
+      gl.linkProgram(program);
+      gl.deleteShader(fs);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(program) || 'unknown link error';
+        gl.deleteProgram(program);
+        throw new Error(name + ' link: ' + log);
+      }
+      const uniforms = {};
+      const n = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+      for (let i = 0; i < n; i++) {
+        const info = gl.getActiveUniform(program, i);
+        if (!info) continue;
+        uniforms[info.name] = gl.getUniformLocation(program, info.name);
+      }
+      return { program: program, u: uniforms, name: name };
+    }
+
+    function initGLResources() {
+      const vs = compileShader(gl.VERTEX_SHADER, VERT, 'vertex');
+      const next = {};
+      const errors = [];
+      Object.keys(FRAGMENTS).forEach(function (name) {
+        try {
+          next[name] = linkProgram(vs, FRAGMENTS[name], name);
+        } catch (err) {
+          errors.push(err.message);
+        }
+      });
+      gl.deleteShader(vs);
+      programs = next;
+      if (!programs.normal) {
+        throw new Error(errors.join(' | ') || 'Normal shader failed');
+      }
+      if (programs.tunnel && !programs.tunnel.u.tunnelRadius) {
+        errors.push('tunnelRadius uniform missing from the tunnel shader');
+      }
+      if (programs.color && !programs.color.u.u_matrix) {
+        errors.push('color matrix uniform missing');
+      }
+      if (errors.length) {
+        showBanner('Some effects failed to compile. ' + errors[0], { kind: 'error', sticky: true });
+      }
+
+      quadBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1, -1, 0, 0,
+         1, -1, 1, 0,
+        -1,  1, 0, 1,
+         1,  1, 1, 1
+      ]), gl.STATIC_DRAW);
+
+      videoTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([20, 18, 15, 255]));
+
+      const tinyTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tinyTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 8, 8, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      const fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tinyTex, 0);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
+        readback = { fb: fb, tex: tinyTex, pixels: new Uint8Array(8 * 8 * 4) };
+      } else {
+        readback = null;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.clearColor(0.078, 0.071, 0.059, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+
+    function programFor(mode) {
+      const info = MODE_INFO[mode] || MODE_INFO.normal;
+      return programs[info.program] || programs.normal;
+    }
+
+    function activeMode() {
+      return comparing ? 'normal' : currentMode;
+    }
+
+    function coverFor(texW, texH, viewW, viewH) {
+      if (!texW || !texH || !viewW || !viewH) return { sx: 1, sy: 1, ox: 0, oy: 0 };
+      const texAspect = texW / texH;
+      const viewAspect = viewW / viewH;
+      if (viewAspect > texAspect) {
+        const sy = texAspect / viewAspect;
+        return { sx: 1, sy: sy, ox: 0, oy: (1 - sy) / 2 };
+      }
+      const sx = viewAspect / texAspect;
+      return { sx: sx, sy: 1, ox: (1 - sx) / 2, oy: 0 };
+    }
+
+    function defaultFlip() {
+      return sourceType === 'video' || sourceType === 'pattern';
+    }
+
+    function setCommon(p, viewW, viewH, cover, doFlip, doMirror, chart) {
+      const u = p.u;
+      if (u.u_tex) gl.uniform1i(u.u_tex, 0);
+      if (u.u_uvScale) gl.uniform2f(u.u_uvScale, cover.sx, cover.sy);
+      if (u.u_uvOffset) gl.uniform2f(u.u_uvOffset, cover.ox, cover.oy);
+      if (u.u_flipY) gl.uniform1f(u.u_flipY, doFlip ? 1 : 0);
+      if (u.u_mirror) gl.uniform1f(u.u_mirror, doMirror ? 1 : 0);
+      const aspect = circularField ? viewW / Math.max(viewH, 1) : 1;
+      if (u.u_aspect) gl.uniform1f(u.u_aspect, aspect);
+      if (u.u_texel) gl.uniform2f(u.u_texel, 1 / Math.max(viewW, 1), 1 / Math.max(viewH, 1));
+      if (u.u_frameLuma) gl.uniform1f(u.u_frameLuma, frameLuma);
+      if (u.u_chart) gl.uniform1f(u.u_chart, chart ? 1 : 0);
+    }
+
+    function setModeUniforms(p, mode) {
+      const u = p.u;
+      if (mode === 'tunnel' || mode === 'peripheral') {
+        const params = modeParams[mode];
+        if (u.tunnelRadius) gl.uniform1f(u.tunnelRadius, params.radius);
+        if (u.u_falloff) gl.uniform1f(u.u_falloff, params.falloff);
+      } else if (mode === 'central') {
+        if (u.u_radius) gl.uniform1f(u.u_radius, modeParams.central.radius);
+        if (u.u_blurPx) gl.uniform1f(u.u_blurPx, modeParams.central.blur);
+        if (u.u_darken) gl.uniform1f(u.u_darken, modeParams.central.darken);
+      } else if (MATRICES[mode]) {
+        if (u.u_matrix) gl.uniformMatrix3fv(u.u_matrix, false, MATRICES[mode]);
+      } else if (mode === 'night') {
+        const params = modeParams.night;
+        if (u.u_dim) gl.uniform1f(u.u_dim, params.dim);
+        if (u.u_desat) gl.uniform1f(u.u_desat, params.desat);
+        if (u.u_blurPx) gl.uniform1f(u.u_blurPx, params.blur);
+        if (u.u_force) gl.uniform1f(u.u_force, params.force);
+        if (u.u_bright) gl.uniform1f(u.u_bright, 0.50);
+        if (u.u_dark) gl.uniform1f(u.u_dark, 0.12);
+      } else if (mode === 'light') {
+        const params = modeParams.light;
+        if (u.u_threshold) gl.uniform1f(u.u_threshold, params.threshold);
+        if (u.u_boost) gl.uniform1f(u.u_boost, params.boost);
+        if (u.u_contrast) gl.uniform1f(u.u_contrast, params.contrast);
+        if (u.u_glow) gl.uniform1f(u.u_glow, params.glow);
+        if (u.u_spike) gl.uniform1f(u.u_spike, spikeLevel);
+        if (u.u_glowStep) gl.uniform1f(u.u_glowStep, 0.014);
+      }
+    }
+
+    function drawEffect(texture, viewW, viewH, cover, doFlip, doMirror) {
+      const mode = activeMode();
+      const p = programFor(mode);
+      gl.useProgram(p.program);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+      gl.enableVertexAttribArray(0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+      gl.disable(gl.DEPTH_TEST);
+      gl.disable(gl.BLEND);
+      gl.disable(gl.CULL_FACE);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      setCommon(p, viewW, viewH, cover, doFlip, doMirror, chartOn);
+      setModeUniforms(p, mode);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    function checkGL(where) {
+      if (glErrorShown || !gl) return;
+      const err = gl.getError();
+      if (err && err !== gl.NO_ERROR) {
+        glErrorShown = true;
+        showBanner('WebGL error ' + err + ' during ' + where + '. If the image is upside down, use Flip.', { kind: 'warn', sticky: true });
+      }
+    }
+
+    function resizeCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
+      let w = Math.max(2, Math.round(window.innerWidth * dpr));
+      let h = Math.max(2, Math.round(window.innerHeight * dpr));
+      const maxEdge = 1920;
+      const edge = Math.max(w, h);
+      if (edge > maxEdge) {
+        const s = maxEdge / edge;
+        w = Math.max(2, Math.round(w * s));
+        h = Math.max(2, Math.round(h * s));
+      }
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    }
+
+    function updateSourceTexture() {
+      if (!gl || gl.isContextLost()) return false;
+      gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      try {
+        if (sourceType === 'video') {
+          if (video.readyState < 2 || !video.videoWidth) return false;
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+          sourceW = video.videoWidth;
+          sourceH = video.videoHeight;
+          return true;
+        }
+        if (sourceType === 'pattern') {
+          drawPattern(performance.now());
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, patternCanvas);
+          sourceW = patternCanvas.width;
+          sourceH = patternCanvas.height;
+          return true;
+        }
+      } catch (err) {
+        showBanner('Could not upload the camera frame. ' + (err.message || ''), { kind: 'error' });
+        return false;
+      }
+      return false;
+    }
+
+    function sampleElementLuma(el, w, h) {
+      if (!el || !w || !h) return -1;
+      try {
+        lumaCtx.drawImage(el, 0, 0, lumaCanvas.width, lumaCanvas.height);
+        const data = lumaCtx.getImageData(0, 0, lumaCanvas.width, lumaCanvas.height).data;
+        let sum = 0;
+        const n = data.length / 4;
+        for (let i = 0; i < data.length; i += 4) {
+          sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+        }
+        return sum / (n * 255);
+      } catch (err) {
+        return -1;
+      }
+    }
+
+    function spikeEnvelope(t) {
+      if (t <= 0) return 1;
+      if (t >= 1) return 0;
+      const s = t * t * (3 - 2 * t);
+      return 1 - s;
+    }
+
+    function updateSpike(luma, now) {
+      const hi = modeParams.light.threshold;
+      const lo = hi - 0.10;
+      if (luma <= lo) spikeArmed = true;
+      if (spikeArmed && luma >= hi) {
+        spikeArmed = false;
+        spikeStart = now;
+      }
+      if (!spikeArmed) spikeLevel = spikeEnvelope((now - spikeStart) / 1000);
+      else spikeLevel = 0;
+      if (spikeLevel < 0.02) {
+        els.glareChip.hidden = true;
+      } else {
+        els.glareChip.hidden = false;
+        els.glareChip.style.opacity = String(Math.min(1, spikeLevel + 0.35));
+      }
+    }
+
+    function noteLuma(raw, now) {
+      if (!(raw >= 0)) return;
+      updateSpike(raw, now);
+      frameLuma = frameLuma < 0 ? raw : frameLuma * 0.82 + raw * 0.18;
+    }
+
+    function renderWindow(now) {
+      if (sourceType === 'pattern' && renderPath === 'css') drawPattern(now);
+      if (renderPath !== 'webgl' || !gl || gl.isContextLost()) return;
+      resizeCanvas();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      const ready = updateSourceTexture();
+      if (!ready) {
+        gl.clearColor(0.078, 0.071, 0.059, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        return;
+      }
+      const el = sourceType === 'video' ? video : patternCanvas;
+      noteLuma(sampleElementLuma(el, sourceW, sourceH), now);
+      const cover = coverFor(sourceW, sourceH, canvas.width, canvas.height);
+      const doFlip = userFlip ? !defaultFlip() : defaultFlip();
+      drawEffect(videoTexture, canvas.width, canvas.height, cover, doFlip, userMirror);
+      checkGL('webcam draw');
+    }
+
+    function loop(now) {
+      if (xrSession) {
+        loopOn = false;
+        return;
+      }
+      loopOn = true;
+      requestAnimationFrame(loop);
+      renderWindow(now);
+      updateFps(now);
+    }
+
+    function startLoop() {
+      if (loopOn || xrSession) return;
+      loopOn = true;
+      requestAnimationFrame(loop);
+    }
+
+    function updateFps(now) {
+      fpsFrames++;
+      const dt = now - fpsStamp;
+      if (dt < 500) return;
+      fpsValue = Math.round(fpsFrames * 1000 / dt);
+      fpsFrames = 0;
+      fpsStamp = now;
+      let label = fpsValue + ' FPS';
+      els.fps.classList.remove('mid', 'low');
+      if (fpsValue < 30) {
+        label += ' · low';
+        els.fps.classList.add('low');
+      } else if (fpsValue < 50) {
+        els.fps.classList.add('mid');
+      }
+      els.fps.textContent = label;
+    }
+
+    /* ---------- test pattern (only when the camera is unavailable) ---------- */
+
+    function drawPattern(now) {
+      const c = patternCtx;
+      const w = patternCanvas.width;
+      const h = patternCanvas.height;
+      const cycle = (now / 1000) % 9;
+      const lightsOn = cycle < 5.6;
+      c.fillStyle = lightsOn ? '#cfc3b4' : '#161311';
+      c.fillRect(0, 0, w, h);
+      c.fillStyle = lightsOn ? '#8d7358' : '#241f1b';
+      c.fillRect(0, h * 0.62, w, h * 0.38);
+
+      c.fillStyle = lightsOn ? '#f4f8ff' : '#2c384c';
+      c.fillRect(w * 0.07, h * 0.07, w * 0.30, h * 0.38);
+      c.strokeStyle = lightsOn ? '#4e463e' : '#0c0b0a';
+      c.lineWidth = 8;
+      c.strokeRect(w * 0.07, h * 0.07, w * 0.30, h * 0.38);
+      c.beginPath();
+      c.moveTo(w * 0.22, h * 0.07);
+      c.lineTo(w * 0.22, h * 0.45);
+      c.moveTo(w * 0.07, h * 0.26);
+      c.lineTo(w * 0.37, h * 0.26);
+      c.stroke();
+
+      if (lightsOn) {
+        const g = c.createRadialGradient(w * 0.8, h * 0.18, 8, w * 0.8, h * 0.18, 180);
+        g.addColorStop(0, 'rgba(255, 246, 214, 0.95)');
+        g.addColorStop(1, 'rgba(255, 246, 214, 0)');
+        c.fillStyle = g;
+        c.fillRect(w * 0.45, 0, w * 0.55, h * 0.55);
+        c.fillStyle = '#fff4cc';
+        c.beginPath();
+        c.arc(w * 0.8, h * 0.18, 26, 0, Math.PI * 2);
+        c.fill();
+      } else {
+        c.fillStyle = '#3a342c';
+        c.beginPath();
+        c.arc(w * 0.8, h * 0.18, 16, 0, Math.PI * 2);
+        c.fill();
+      }
+
+      c.fillStyle = '#d01212';
+      c.fillRect(w * 0.46, h * 0.58, 50, 42);
+      c.fillStyle = '#1e8a3a';
+      c.beginPath();
+      c.arc(w * 0.60, h * 0.56, 34, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = '#1d4ed8';
+      c.fillRect(w * 0.70, h * 0.60, 78, 36);
+      c.fillStyle = '#f2c200';
+      c.beginPath();
+      c.ellipse(w * 0.36, h * 0.72, 30, 22, 0, 0, Math.PI * 2);
+      c.fill();
+
+      c.fillStyle = lightsOn ? '#f7f4ee' : '#3a342e';
+      c.fillRect(w * 0.30, h * 0.30, w * 0.40, h * 0.20);
+      c.fillStyle = lightsOn ? '#161412' : '#d9d0c4';
+      c.font = '600 40px Georgia, serif';
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillText('VISION', w * 0.5, h * 0.37);
+      c.font = '600 16px sans-serif';
+      c.fillText('E   F   P   T   O   Z', w * 0.5, h * 0.45);
+
+      const t = now / 1000;
+      const bx = (0.12 + 0.76 * (0.5 + 0.5 * Math.sin(t * 1.2))) * w;
+      const by = (0.16 + 0.06 * Math.sin(t * 2.4)) * h;
+      c.fillStyle = '#ff5a1f';
+      c.beginPath();
+      c.arc(bx, by, 14, 0, Math.PI * 2);
+      c.fill();
+
+      c.fillStyle = '#f4efe6';
+      c.fillRect(14, 14, 28, 28);
+      c.fillRect(w - 42, 14, 28, 28);
+      c.fillRect(14, h - 42, 28, 28);
+      c.fillRect(w - 42, h - 42, 28, 28);
+
+      c.globalAlpha = 0.85;
+      c.fillStyle = lightsOn ? '#161412' : '#f4efe6';
+      c.font = '600 13px sans-serif';
+      c.textAlign = 'left';
+      c.textBaseline = 'alphabetic';
+      c.fillText(lightsOn ? 'TEST PATTERN  ·  LIGHTS ON' : 'TEST PATTERN  ·  LIGHTS OFF', 16, h - 16);
+      c.globalAlpha = 1;
+    }
+
+    /* ---------- camera ---------- */
+
+    function cameraErrorMessage(err) {
+      if (!window.isSecureContext) {
+        return 'Camera and WebXR need a secure context. Open this page over HTTPS or localhost — file:// will not work.';
+      }
+      const name = err && err.name;
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        return 'Camera access denied. Allow camera permission in the browser and try again.';
+      }
+      if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        return 'No camera found on this device.';
+      }
+      if (name === 'NotReadableError' || name === 'TrackStartError') {
+        return 'Camera is busy or unavailable. Close other apps using it and try again.';
+      }
+      if (name === 'OverconstrainedError') {
+        return 'The camera could not match the requested constraints.';
+      }
+      if (name === 'SecurityError') {
+        return 'Camera blocked by the browser security policy.';
+      }
+      return 'Camera error: ' + ((err && err.message) || 'unknown');
+    }
+
+    function stopStream() {
+      if (stream) {
+        stream.getTracks().forEach(function (track) { track.stop(); });
+        stream = null;
+      }
+      video.srcObject = null;
+      if (sourceType === 'video') {
+        sourceType = 'none';
+        document.body.dataset.source = 'none';
+      }
+    }
+
+    async function startWebcam(opts) {
+      opts = opts || {};
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw Object.assign(new Error('No camera API'), { name: 'NotFoundError' });
+      }
+      if (!window.isSecureContext) {
+        throw Object.assign(new Error('Insecure context'), { name: 'SecurityError' });
+      }
+      els.btnCam.disabled = true;
+      els.btnCam.textContent = 'Starting camera…';
+      const attempts = [
+        { video: { facingMode: 'environment' }, audio: false },
+        { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+        { video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+        { video: true, audio: false }
+      ];
+      let lastErr = null;
+      let next = null;
+      for (let i = 0; i < attempts.length; i++) {
+        try {
+          next = await navigator.mediaDevices.getUserMedia(attempts[i]);
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) break;
+        }
+      }
+      els.btnCam.disabled = false;
+      els.btnCam.textContent = 'Start camera';
+      if (!next) throw lastErr || new Error('Camera failed');
+      stopStream();
+      stream = next;
+      const track = stream.getVideoTracks()[0];
+      if (track && track.applyConstraints) {
+        try {
+          await track.applyConstraints({ width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 } });
+        } catch (err) { /* resolution cap is best-effort */ }
+      }
+      video.srcObject = stream;
+      video.muted = true;
+      video.setAttribute('playsinline', '');
+      video.setAttribute('webkit-playsinline', '');
+      video.playsInline = true;
+      try {
+        await video.play();
+      } catch (err) {
+        showBanner('Tap the page if the preview does not start.', { kind: 'warn' });
+      }
+      sourceType = 'video';
+      document.body.dataset.source = 'video';
+      const settings = track && track.getSettings ? track.getSettings() : {};
+      if (settings.facingMode === 'user') userMirror = true;
+      else userMirror = false;
+      syncToggle(els.btnMirror, userMirror);
+      const facing = settings.facingMode === 'environment' ? 'Rear camera' : (settings.facingMode === 'user' ? 'Front camera' : 'Camera');
+      markLive(facing + (userMirror ? ' · mirrored' : ''));
+      if (!opts.keepXR) {
+        /* page mode */
+      }
+      startLoop();
+      return settings;
+    }
+
+    function startPattern() {
+      stopStream();
+      sourceType = 'pattern';
+      document.body.dataset.source = 'pattern';
+      userMirror = false;
+      syncToggle(els.btnMirror, false);
+      markLive('Test pattern');
+      showBanner('Test pattern only — not the live room. Lights cycle so night blindness and glare can be checked without a camera.', { kind: 'warn' });
+      startLoop();
+    }
+
+    function markLive(sourceLabel) {
+      document.body.dataset.live = '1';
+      els.liveWord.textContent = 'Live';
+      els.gate.hidden = true;
+      els.dock.hidden = false;
+      updateSourceChip(sourceLabel);
+    }
+
+    function updateSourceChip(extra) {
+      const path = renderPath === 'css' ? 'CSS fallback' : 'WebGL';
+      let src = extra || els.sourceChip.dataset.src || 'No source';
+      if (extra) els.sourceChip.dataset.src = extra;
+      else src = els.sourceChip.dataset.src || src;
+      let size = '';
+      if (sourceW && sourceH && sourceType !== 'none') size = ' · ' + sourceW + '×' + sourceH;
+      let xr = '';
+      if (xrSession) xr = xrCameraSeen ? ' · XR camera' : ' · XR';
+      const text = path + ' · ' + src + size + xr;
+      if (text === lastChipText) return;
+      lastChipText = text;
+      els.sourceChip.textContent = text;
+    }
+
+    /* ---------- WebXR ---------- */
+
+    function getXRCameraTexture(frame, view) {
+      if (!glBinding || !view) return null;
+      if (view.camera) {
+        try {
+          const tex = glBinding.getCameraImage(view.camera);
+          if (tex) return tex;
+        } catch (err) { /* legacy signature below */ }
+      }
+      try {
+        if (glBinding.getCameraImage && frame) return glBinding.getCameraImage(frame, view);
+      } catch (err) { /* not this browser's shape */ }
+      return null;
+    }
+
+    async function enterAR(requireCamera) {
+      if (!navigator.xr || !navigator.xr.requestSession) {
+        showBanner('AR not supported on this device.', { kind: 'error', sticky: true });
+        return false;
+      }
+      if (renderPath !== 'webgl' || !gl) {
+        showBanner('AR needs WebGL, which is not available. Use the camera instead.', { kind: 'error', sticky: true });
+        return false;
+      }
+      if (xrSession) {
+        try { xrSession.end(); } catch (err) { /* already ending */ }
+        return false;
+      }
+      /* One requestSession per click. A second attempt in the same turn loses
+         the user gesture and is rejected. A later click uses a simpler init. */
+      const clickIndex = requireCamera ? -1 : arClicks++;
+      let init;
+      if (requireCamera) {
+        init = {
+          requiredFeatures: ['camera-access'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: overlay }
+        };
+      } else if (clickIndex === 0) {
+        init = {
+          optionalFeatures: ['camera-access', 'dom-overlay'],
+          domOverlay: { root: overlay }
+        };
+      } else {
+        init = { optionalFeatures: ['camera-access'] };
+      }
+      els.btnAR.disabled = true;
+      let session = null;
+      try {
+        session = await navigator.xr.requestSession('immersive-ar', init);
+        await startXRSession(session);
+        return true;
+      } catch (err) {
+        if (session) {
+          try { session.end(); } catch (endErr) { /* ignore */ }
+        }
+        const msg = (err && err.message) ? err.message : String(err);
+        if (requireCamera) {
+          showBanner('AR camera access was denied or is not supported on this device. ' + msg, { kind: 'error' });
+        } else if (clickIndex === 0) {
+          showBanner('Could not start AR (' + msg + '). Tap Enter AR again to try a simpler session.', { kind: 'error' });
+        } else {
+          showBanner('Could not start AR. ' + msg, { kind: 'error' });
+        }
+        return false;
+      } finally {
+        els.btnAR.disabled = false;
+      }
+    }
+
+    async function startXRSession(session) {
+      xrSession = session;
+      xrCameraSeen = false;
+      xrFrames = 0;
+      xrWarned = false;
+      document.body.dataset.xr = '1';
+      session.addEventListener('end', onXREnd);
+      if (gl && gl.makeXRCompatible) {
+        try { await gl.makeXRCompatible(); } catch (err) { /* layer creation will fail clearly */ }
+      }
+      if (gl && gl.isContextLost && gl.isContextLost()) {
+        await new Promise(function (resolve) {
+          canvas.addEventListener('webglcontextrestored', resolve, { once: true });
+        });
+      }
+      if (!programs.normal) initGLResources();
+      const layer = new XRWebGLLayer(session, gl, {
+        alpha: true,
+        antialias: false,
+        depth: false,
+        stencil: false,
+        framebufferScaleFactor: qualityName === 'performance' ? 0.7 : 1
+      });
+      await session.updateRenderState({ baseLayer: layer });
+      try {
+        xrRefSpace = await session.requestReferenceSpace('viewer');
+      } catch (err) {
+        xrRefSpace = await session.requestReferenceSpace('local');
+      }
+      if (typeof XRWebGLBinding === 'function') {
+        try { glBinding = new XRWebGLBinding(session, gl); }
+        catch (err) { glBinding = null; }
+      } else {
+        glBinding = null;
+      }
+      els.gate.hidden = true;
+      els.dock.hidden = false;
+      els.btnExitAR.hidden = false;
+      els.btnXRCam.hidden = false;
+      els.btnRetryXR.hidden = false;
+      document.body.dataset.live = '1';
+      els.liveWord.textContent = 'Live';
+      updateSourceChip('AR passthrough');
+      const features = (session.enabledFeatures && session.enabledFeatures.length)
+        ? session.enabledFeatures.join(', ')
+        : 'not reported';
+      showBanner('AR session started. Enabled features: ' + features + '. If camera-access is missing, passthrough stays unfiltered until you use the device camera.', { kind: 'info' });
+      session.requestAnimationFrame(onXRFrame);
+    }
+
+    function onXREnd() {
+      xrSession = null;
+      glBinding = null;
+      xrRefSpace = null;
+      document.body.dataset.xr = '0';
+      els.btnExitAR.hidden = true;
+      els.btnXRCam.hidden = true;
+      els.btnRetryXR.hidden = true;
+      xrCameraSeen = false;
+      resizeCanvas();
+      if (sourceType === 'none') {
+        document.body.dataset.live = '0';
+        els.liveWord.textContent = 'Standby';
+        els.gate.hidden = false;
+        els.dock.hidden = true;
+        updateSourceChip('No source yet');
+      } else {
+        startLoop();
+      }
+      showBanner('AR session ended.', { kind: 'info' });
+    }
+
+    function maybeWarnXR() {
+      if (xrWarned || xrCameraSeen || sourceType === 'video') return;
+      if (xrFrames < 40) return;
+      xrWarned = true;
+      showBanner('This headset browser is not exposing passthrough pixels (no camera-access). The room is unfiltered. Use device camera to run the shader, or retry AR with camera access required.', { kind: 'warn', sticky: true });
+    }
+
+    function tryReadLuma(texture, restoreFB, vp, cover, doFlip) {
+      if (!readback || readbackFailed || !programs.normal) return -1;
+      try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, readback.fb);
+        gl.viewport(0, 0, 8, 8);
+        const p = programs.normal;
+        gl.useProgram(p.program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+        gl.enableVertexAttribArray(0);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+        gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        setCommon(p, 8, 8, cover, doFlip, false, false);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.readPixels(0, 0, 8, 8, gl.RGBA, gl.UNSIGNED_BYTE, readback.pixels);
+        const err = gl.getError();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, restoreFB);
+        if (vp) gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        if (err && err !== gl.NO_ERROR) {
+          readbackFailed = true;
+          return -1;
+        }
+        let sum = 0;
+        const px = readback.pixels;
+        const n = px.length / 4;
+        for (let i = 0; i < px.length; i += 4) {
+          sum += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
+        }
+        return sum / (n * 255);
+      } catch (err) {
+        readbackFailed = true;
+        try { gl.bindFramebuffer(gl.FRAMEBUFFER, restoreFB); } catch (e) { /* ignore */ }
+        return -1;
+      }
+    }
+
+    function onXRFrame(time, frame) {
+      const session = frame.session;
+      if (session !== xrSession) return;
+      session.requestAnimationFrame(onXRFrame);
+      xrFrames++;
+      const layer = session.renderState.baseLayer;
+      const pose = xrRefSpace ? frame.getViewerPose(xrRefSpace) : null;
+      if (!layer || !pose) {
+        maybeWarnXR();
+        updateFps(time);
+        return;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+      let sampled = false;
+      for (let i = 0; i < pose.views.length; i++) {
+        const view = pose.views[i];
+        const vp = layer.getViewport(view);
+        if (!vp) continue;
+        gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        let tex = getXRCameraTexture(frame, view);
+        let cover = { sx: 1, sy: 1, ox: 0, oy: 0 };
+        let texW = vp.width;
+        let texH = vp.height;
+        let fromVideo = false;
+        if (tex) {
+          if (!xrCameraSeen) {
+            xrCameraSeen = true;
+            updateSourceChip('AR camera-access');
+            /* Page camera and passthrough camera fight. Drop the page stream
+               once the headset is actually providing pixels. */
+            if (sourceType === 'video') stopStream();
+          }
+          if (view.camera) {
+            texW = view.camera.width || vp.width;
+            texH = view.camera.height || vp.height;
+          }
+        } else if (sourceType === 'video') {
+          if (updateSourceTexture()) {
+            tex = videoTexture;
+            fromVideo = true;
+            cover = coverFor(sourceW, sourceH, vp.width, vp.height);
+            texW = sourceW;
+            texH = sourceH;
+          }
+        }
+        if (!tex) {
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(vp.x, vp.y, vp.width, vp.height);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.disable(gl.SCISSOR_TEST);
+          continue;
+        }
+        const doFlip = fromVideo ? (userFlip ? !defaultFlip() : defaultFlip()) : userFlip;
+        if (!sampled) {
+          let raw = -1;
+          if (fromVideo) raw = sampleElementLuma(sourceType === 'video' ? video : patternCanvas, sourceW, sourceH);
+          else if (xrFrames % 6 === 0) raw = tryReadLuma(tex, layer.framebuffer, vp, cover, doFlip);
+          if (raw >= 0) noteLuma(raw, time);
+          else if (frameLuma >= 0) updateSpike(frameLuma, time);
+          sampled = true;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+          gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        }
+        try {
+          drawEffect(tex, vp.width, vp.height, cover, doFlip, fromVideo && userMirror);
+        } catch (err) {
+          showBanner('AR draw failed: ' + (err.message || err), { kind: 'error' });
+        }
+      }
+      checkGL('AR draw');
+      maybeWarnXR();
+      updateFps(time);
+    }
+
+    /* ---------- UI ---------- */
+
+    function showBanner(text, opts) {
+      opts = opts || {};
+      els.banner.hidden = false;
+      els.banner.dataset.kind = opts.kind || 'info';
+      els.banner.dataset.sticky = opts.sticky ? '1' : '0';
+      els.bannerText.textContent = text;
+      clearTimeout(bannerTimer);
+      if (!opts.sticky) {
+        bannerTimer = setTimeout(function () {
+          if (els.banner.dataset.sticky !== '1') els.banner.hidden = true;
+        }, 7000);
+      }
+    }
+
+    function syncToggle(btn, on) {
+      if (btn) btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+
+    function fmt(n, d) {
+      return Number(n).toFixed(d);
+    }
+
+    function syncSliders() {
+      const map = [
+        ['slTunnelR', 'outTunnelR', modeParams.tunnel.radius, 2],
+        ['slTunnelF', 'outTunnelF', modeParams.tunnel.falloff, 2],
+        ['slPeriphR', 'outPeriphR', modeParams.peripheral.radius, 2],
+        ['slPeriphF', 'outPeriphF', modeParams.peripheral.falloff, 3],
+        ['slCentralR', 'outCentralR', modeParams.central.radius, 2],
+        ['slCentralB', 'outCentralB', modeParams.central.blur, 0],
+        ['slCentralD', 'outCentralD', modeParams.central.darken, 2],
+        ['slNightF', 'outNightF', modeParams.night.force, 2],
+        ['slNightD', 'outNightD', modeParams.night.dim, 2],
+        ['slLightT', 'outLightT', modeParams.light.threshold, 2],
+        ['slLightG', 'outLightG', modeParams.light.glow, 2]
+      ];
+      map.forEach(function (row) {
+        const input = document.getElementById(row[0]);
+        const output = document.getElementById(row[1]);
+        if (input) input.value = String(row[2]);
+        if (output) output.textContent = fmt(row[2], row[3]);
+      });
+    }
+
+    function setComparing(on) {
+      comparing = !!on;
+      syncToggle(els.btnCompare, comparing);
+      if (comparing) els.modeLabel.textContent = 'Comparing · Normal';
+      else if (MODE_INFO[currentMode]) els.modeLabel.textContent = MODE_INFO[currentMode].label;
+    }
+
+    function setMode(modeName) {
+      let name = String(modeName || '').toLowerCase();
+      const aliases = {
+        color: colorSub || 'deuteranopia',
+        cvd: colorSub || 'deuteranopia',
+        nyctalopia: 'night',
+        photophobia: 'light',
+        glare: 'light',
+        macular: 'central',
+        glaucoma: 'peripheral',
+        rp: 'peripheral'
+      };
+      if (aliases[name]) name = aliases[name];
+      if (!MODE_INFO[name] || name === 'color') return;
+      currentMode = name;
+      if (MODE_INFO[name].group === 'color') colorSub = name;
+      if (!chartUserSet) chartOn = MODE_INFO[name].group === 'color';
+      updateUI();
+    }
+
+    function updateUI() {
+      const info = MODE_INFO[currentMode] || MODE_INFO.normal;
+      const group = info.group;
+      document.body.dataset.mode = currentMode;
+      document.body.dataset.group = group;
+      els.modeLabel.textContent = info.label;
+      els.modeDesc.textContent = info.desc;
+      const buttons = document.querySelectorAll('.modes button');
+      buttons.forEach(function (btn) {
+        const mode = btn.getAttribute('data-mode');
+        const on = mode === 'color' ? group === 'color' : mode === currentMode;
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      const subs = els.subColor.querySelectorAll('button');
+      subs.forEach(function (btn) {
+        btn.setAttribute('aria-pressed', btn.getAttribute('data-mode') === currentMode ? 'true' : 'false');
+      });
+      els.subColor.hidden = group !== 'color';
+      document.getElementById('ctrlTunnel').hidden = group !== 'tunnel';
+      document.getElementById('ctrlPeripheral').hidden = group !== 'peripheral';
+      document.getElementById('ctrlCentral').hidden = group !== 'central';
+      document.getElementById('ctrlNight').hidden = group !== 'night';
+      document.getElementById('ctrlLight').hidden = group !== 'light';
+      els.chartLegend.hidden = !chartOn;
+      syncToggle(els.btnChart, chartOn);
+      if (renderPath === 'css' && group === 'color') {
+        showBanner('Color matrices need WebGL. This CSS fallback cannot simulate protanopia, deuteranopia, or tritanopia.', { kind: 'warn', sticky: true });
+      }
+    }
+
+    function bindSlider(id, outId, bucket, key, digits) {
+      const input = document.getElementById(id);
+      const output = document.getElementById(outId);
+      input.addEventListener('input', function () {
+        const value = parseFloat(input.value);
+        modeParams[bucket][key] = value;
+        output.textContent = fmt(value, digits);
+      });
+    }
+
+    function nudgeRadius(delta) {
+      const group = (MODE_INFO[currentMode] || {}).group;
+      if (group === 'tunnel') modeParams.tunnel.radius = clamp(modeParams.tunnel.radius + delta, 0.1, 0.7);
+      else if (group === 'peripheral') modeParams.peripheral.radius = clamp(modeParams.peripheral.radius + delta, 0.06, 0.4);
+      else if (group === 'central') modeParams.central.radius = clamp(modeParams.central.radius + delta, 0.06, 0.45);
+      else return;
+      syncSliders();
+    }
+
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+    function buildLegend() {
+      CHART_COLORS.forEach(function (rgb, i) {
+        const sw = document.createElement('i');
+        sw.className = 'swatch';
+        sw.title = CHART_NAMES[i];
+        sw.style.background = 'rgb(' + Math.round(rgb[0] * 255) + ',' + Math.round(rgb[1] * 255) + ',' + Math.round(rgb[2] * 255) + ')';
+        els.chartLegend.appendChild(sw);
+      });
+    }
+
+    function activateCssFallback(reason) {
+      renderPath = 'css';
+      document.body.dataset.path = 'css';
+      if (videoTexture && gl) {
+        /* context stays, but we won't draw with it */
+      }
+      showBanner(reason + ' You are in the CSS filter fallback (blur and brightness only, no color matrix).', { kind: 'warn', sticky: true });
+      updateSourceChip();
+      updateUI();
+    }
+
+    function showGate() {
+      els.gate.hidden = false;
+      if (sourceType === 'none' && !xrSession) {
+        els.dock.hidden = true;
+        document.body.dataset.live = '0';
+        els.liveWord.textContent = 'Standby';
+      }
+    }
+
+    function onKey(e) {
+      if (e.repeat) return;
+      const tag = e.target && e.target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const key = e.key.toLowerCase();
+      if (key === 'c') {
+        setComparing(true);
+        return;
+      }
+      const map = {
+        '1': 'normal',
+        '2': 'tunnel',
+        '3': 'central',
+        '4': 'peripheral',
+        '5': 'color',
+        '6': 'night',
+        '7': 'light',
+        '8': 'protanopia',
+        '9': 'tritanopia',
+        '0': 'deuteranopia'
+      };
+      if (map[key]) {
+        setMode(map[key]);
+        e.preventDefault();
+      } else if (key === '[') {
+        nudgeRadius(-0.01);
+      } else if (key === ']') {
+        nudgeRadius(0.01);
+      }
+    }
+
+    function wireUI() {
+      document.getElementById('panelBody').addEventListener('click', function (e) {
+        const btn = e.target.closest('[data-mode]');
+        if (!btn) return;
+        setMode(btn.getAttribute('data-mode'));
+      });
+      els.btnAR.addEventListener('click', function () {
+        /* Release the page camera before requestSession so passthrough can
+           take it. stop() is synchronous, so the gesture is still valid. */
+        const hadVideo = sourceType === 'video';
+        if (hadVideo) stopStream();
+        enterAR(false).then(function (started) {
+          if (!started && hadVideo && !xrSession) {
+            startWebcam().catch(function (err) {
+              showBanner(cameraErrorMessage(err), { kind: 'error' });
+            });
+          }
+        });
+      });
+      els.btnCam.addEventListener('click', function () {
+        startWebcam().catch(function (err) {
+          showBanner(cameraErrorMessage(err), { kind: 'error', sticky: true });
+        });
+      });
+      els.btnPattern.addEventListener('click', startPattern);
+      els.btnExitAR.addEventListener('click', function () {
+        if (xrSession) xrSession.end();
+      });
+      els.btnRetryXR.addEventListener('click', function () { enterAR(true); });
+      els.btnXRCam.addEventListener('click', function () {
+        startWebcam({ keepXR: true }).then(function () {
+          showBanner('Shader is running on the device camera inside AR. This fallback is monoscopic.', { kind: 'info' });
+          updateSourceChip('Device camera in AR');
+        }).catch(function (err) {
+          showBanner(cameraErrorMessage(err), { kind: 'error' });
+        });
+      });
+      els.btnCollapse.addEventListener('click', function () {
+        const open = els.btnCollapse.getAttribute('aria-expanded') === 'true';
+        els.panelBody.hidden = open;
+        els.btnCollapse.setAttribute('aria-expanded', open ? 'false' : 'true');
+        els.btnCollapse.textContent = open ? 'Show' : 'Hide';
+      });
+      els.btnShow.addEventListener('click', function () {
+        els.dock.hidden = false;
+        els.btnShow.hidden = true;
+      });
+      els.btnCompare.addEventListener('pointerdown', function (e) {
+        setComparing(true);
+        try { els.btnCompare.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      });
+      function endCompare() {
+        setComparing(false);
+      }
+      els.btnCompare.addEventListener('pointerup', endCompare);
+      els.btnCompare.addEventListener('pointercancel', endCompare);
+      els.btnCompare.addEventListener('lostpointercapture', endCompare);
+      els.btnChart.addEventListener('click', function () {
+        chartUserSet = true;
+        chartOn = !chartOn;
+        updateUI();
+      });
+      els.btnMirror.addEventListener('click', function () {
+        userMirror = !userMirror;
+        syncToggle(els.btnMirror, userMirror);
+      });
+      els.btnFlip.addEventListener('click', function () {
+        userFlip = !userFlip;
+        syncToggle(els.btnFlip, userFlip);
+      });
+      els.btnRound.addEventListener('click', function () {
+        circularField = !circularField;
+        syncToggle(els.btnRound, circularField);
+      });
+      els.btnQuality.addEventListener('click', function () {
+        if (qualityName === 'balanced') {
+          qualityName = 'sharp';
+          dprCap = 2;
+        } else if (qualityName === 'sharp') {
+          qualityName = 'performance';
+          dprCap = 1;
+        } else {
+          qualityName = 'balanced';
+          dprCap = 1.5;
+        }
+        els.btnQuality.textContent = 'Quality: ' + qualityName;
+        resizeCanvas();
+      });
+      els.btnReset.addEventListener('click', function () {
+        Object.keys(DEFAULT_PARAMS).forEach(function (key) {
+          Object.assign(modeParams[key], DEFAULT_PARAMS[key]);
+        });
+        syncSliders();
+      });
+      els.btnStop.addEventListener('click', function () {
+        stopStream();
+        sourceType = 'none';
+        document.body.dataset.source = 'none';
+        if (gl && renderPath === 'webgl' && !gl.isContextLost()) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, canvas.width, canvas.height);
+          gl.clearColor(0.078, 0.071, 0.059, 1);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+        if (xrSession) {
+          xrSession.end();
+          return;
+        }
+        showGate();
+        lastChipText = '';
+        updateSourceChip('No source yet');
+      });
+      document.getElementById('bannerClose').addEventListener('click', function () {
+        els.banner.hidden = true;
+        els.banner.dataset.sticky = '0';
+      });
+      bindSlider('slTunnelR', 'outTunnelR', 'tunnel', 'radius', 2);
+      bindSlider('slTunnelF', 'outTunnelF', 'tunnel', 'falloff', 2);
+      bindSlider('slPeriphR', 'outPeriphR', 'peripheral', 'radius', 2);
+      bindSlider('slPeriphF', 'outPeriphF', 'peripheral', 'falloff', 3);
+      bindSlider('slCentralR', 'outCentralR', 'central', 'radius', 2);
+      bindSlider('slCentralB', 'outCentralB', 'central', 'blur', 0);
+      bindSlider('slCentralD', 'outCentralD', 'central', 'darken', 2);
+      bindSlider('slNightF', 'outNightF', 'night', 'force', 2);
+      bindSlider('slNightD', 'outNightD', 'night', 'dim', 2);
+      bindSlider('slLightT', 'outLightT', 'light', 'threshold', 2);
+      bindSlider('slLightG', 'outLightG', 'light', 'glow', 2);
+      document.addEventListener('keydown', onKey);
+      document.addEventListener('keyup', function (e) {
+        if (e.key.toLowerCase() === 'c') setComparing(false);
+      });
+      window.addEventListener('resize', resizeCanvas);
+      if (window.visualViewport) window.visualViewport.addEventListener('resize', resizeCanvas);
+      video.addEventListener('click', function () {
+        if (video.srcObject) video.play().catch(function () {});
+      });
+    }
+
+    async function detectAR() {
+      let supported = false;
+      try {
+        if (navigator.xr && navigator.xr.isSessionSupported) {
+          supported = await navigator.xr.isSessionSupported('immersive-ar');
+        }
+      } catch (err) {
+        supported = false;
+      }
+      arSupported = !!supported;
+      els.btnAR.hidden = !arSupported;
+      if (!arSupported) {
+        els.btnCam.classList.remove('btn-ghost');
+        els.btnCam.classList.add('btn-primary');
+        els.gateNote.textContent = 'AR not supported on this device. Using the camera instead.';
+        if (!autoTried && sourceType === 'none' && !xrSession) {
+          autoTried = true;
+          try {
+            await startWebcam();
+          } catch (err) {
+            if (err && err.name === 'NotAllowedError') {
+              els.gateNote.textContent = 'AR not supported on this device. Tap Start camera and allow access.';
+            } else if (err && err.name === 'SecurityError') {
+              showBanner(cameraErrorMessage(err), { kind: 'error', sticky: true });
+              els.gateNote.textContent = 'Camera needs HTTPS or localhost.';
+            } else if (!window.isSecureContext) {
+              showBanner(cameraErrorMessage(err), { kind: 'error', sticky: true });
+            } else {
+              els.gateNote.textContent = 'AR not supported on this device. ' + cameraErrorMessage(err);
+            }
+          }
+        }
+      } else {
+        els.gateNote.textContent = 'This device can start an immersive AR session. Enter AR for passthrough, or use the camera on this screen.';
+      }
+    }
+
+    function boot() {
+      wireUI();
+      buildLegend();
+      syncSliders();
+      setMode('normal');
+      gl = createContext();
+      if (!gl) {
+        activateCssFallback('WebGL unavailable (canvas.getContext("webgl") failed).');
+      } else {
+        canvas.addEventListener('webglcontextlost', function (e) {
+          e.preventDefault();
+          programs = {};
+          showBanner('Graphics context lost. Restoring…', { kind: 'warn' });
+        });
+        canvas.addEventListener('webglcontextrestored', function () {
+          try {
+            initGLResources();
+            showBanner('Graphics context restored.', { kind: 'info' });
+          } catch (err) {
+            activateCssFallback('WebGL could not be restored. ' + err.message);
+          }
+        });
+        try {
+          initGLResources();
+        } catch (err) {
+          activateCssFallback('WebGL shaders failed to compile. ' + err.message);
+        }
+      }
+      if (new URLSearchParams(location.search).has('shaders')) {
+        const chunks = Object.keys(FRAGMENTS).map(function (name) {
+          return '===== ' + name + ' =====\n' + FRAGMENTS[name];
+        });
+        els.shaderDump.hidden = false;
+        els.shaderDump.textContent = chunks.join('\n\n');
+      }
+      if (!window.isSecureContext) {
+        showBanner('Camera and WebXR need a secure context. Use HTTPS or localhost.', { kind: 'error', sticky: true });
+        els.gateNote.textContent = 'This page is not a secure context, so the camera cannot start.';
+        els.btnCam.classList.remove('btn-ghost');
+        els.btnCam.classList.add('btn-primary');
+      } else {
+        detectAR();
+      }
+      if (navigator.xr && navigator.xr.addEventListener) {
+        navigator.xr.addEventListener('devicechange', detectAR);
+      }
+      window.addEventListener('error', function (e) {
+        if (e && e.message) showBanner('Error: ' + e.message, { kind: 'error' });
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        const reason = e.reason && (e.reason.message || e.reason.name || String(e.reason));
+        if (reason) showBanner('Error: ' + reason, { kind: 'error' });
+      });
+
+      window.setMode = setMode;
+      window.VISION = {
+        setMode: setMode,
+        get mode() { return currentMode; },
+        params: modeParams,
+        matrices: MATRICES,
+        shaders: FRAGMENTS
+      };
+      Object.defineProperty(window, 'currentMode', {
+        configurable: true,
+        get: function () { return currentMode; },
+        set: function (v) { setMode(v); }
+      });
+    }
+
+    boot();
+  </script>
+</body>
+</html>
